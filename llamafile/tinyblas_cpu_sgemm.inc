@@ -323,6 +323,11 @@ bool llamafile_sgemm(long m, long n, long k, const void *A, long lda, const void
             return true;
         }
     }
+    else if ((Btype == GGML_TYPE_Q8_0 || Btype == GGML_TYPE_Q8_1) && Ctype == GGML_TYPE_F32) {
+        if (iqk_mul_mat(m, n, k*QK4_0, Atype, A, B, (float *)C, ldc, ith, nth)) {
+            return true;
+        }
+    }
 #endif
 
     switch (Ctype) {
