@@ -292,6 +292,14 @@ struct Q4Bits {
         values[2] = _mm256_and_si256(q4bits, ml);
         values[3] = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), ml);
     }
+    inline void prepare64(const uint8_t * q4, int j) {
+        auto q4bits = _mm256_loadu_si256((const __m256i*)q4 + 2*j+0);
+        values[0] = _mm256_and_si256(q4bits, ml);
+        values[2] = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), ml);
+        q4bits = _mm256_loadu_si256((const __m256i*)q4 + 2*j+1);
+        values[1] = _mm256_and_si256(q4bits, ml);
+        values[3] = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), ml);
+    }
     __m256i values[4];
     const __m256i ml = _mm256_set1_epi8(0xf);
 };
@@ -429,13 +437,36 @@ inline void process_mins_and_scales_16(const __m128i& scales128, const Q8& q8, i
     scales[1] = MM256_SET_M128I(h_scales, h_scales);
 }
 
+template <typename Q8>
+inline void process_mins_and_scales_16_a(const __m128i& scales128, const Q8& q8, int i, float d,
+    __m256 * accm, __m256i * scales) {
+    const __m256i all_scales = _mm256_cvtepi8_epi16(scales128);
+    for (int iy = 0; iy < Q8::nrc_y; ++iy) {
+        const __m256i prod  = _mm256_madd_epi16(all_scales, q8.load_bsums(iy, i));
+        accm[iy] = _mm256_fmadd_ps(_mm256_set1_ps(d * q8.scale(iy, i)), _mm256_cvtepi32_ps(prod), accm[iy]);
+    }
+    const __m128i l_scales = _mm256_extracti128_si256(all_scales, 0);
+    const __m128i h_scales = _mm256_extracti128_si256(all_scales, 1);
+    scales[0] = MM256_SET_M128I(l_scales, l_scales);
+    scales[1] = MM256_SET_M128I(h_scales, h_scales);
+}
+
 struct DequantizerQ3K final : public BaseDequantizer<block_q3_K> {
     DequantizerQ3K(const void * vx, size_t bx) : BaseDequantizer(vx, bx) {}
+
+    constexpr static float min = -4.f;
+
+    //template <typename Q8>
+    //inline void new_block(int i, const Q8& q8, __m256 * accm, __m256 * vd, __m256i * scales) {
+    //    d = GGML_FP16_TO_FP32(x[i].d);
+    //    hbits.load(x[i].hmask);
+    //    process_mins_and_scales_16(make_scales((const uint16_t *)x[i].scales), q8, i, d, vd, accm, scales);
+    //}
     template <typename Q8>
-    inline void new_block(int i, const Q8& q8, __m256 * accm, __m256 * vd, __m256i * scales) {
+    inline void new_block(int i, const Q8& q8, __m256 * accm, __m256i * scales) {
         d = GGML_FP16_TO_FP32(x[i].d);
         hbits.load(x[i].hmask);
-        process_mins_and_scales_16(make_scales((const uint16_t *)x[i].scales), q8, i, GGML_FP16_TO_FP32(x[i].d), vd, accm, scales);
+        process_mins_and_scales_16_a(make_scales((const uint16_t *)x[i].scales), q8, i, -4.f*d, accm, scales);
     }
     inline void prepare(int i, int j) {
         bits.prepare(x[i].qs, j);
@@ -459,7 +490,32 @@ struct DequantizerQ3K final : public BaseDequantizer<block_q3_K> {
     HighBit3 hbits;
 
     const __m128i m32 = _mm_set1_epi8(-32);
-    //Scales8K s8k;
+};
+
+struct DequantizerQ6K final : public BaseDequantizer<block_q6_K> {
+    DequantizerQ6K(const void * vx, size_t bx) : BaseDequantizer(vx, bx) {}
+    constexpr static float min = -32.f;
+    //template <typename Q8>
+    //inline void new_block(int i, const Q8& q8, __m256 * accm, __m256 * vd, __m256i * scales) {
+    //    d = GGML_FP16_TO_FP32(x[i].d);
+    //    process_mins_and_scales_16(_mm_loadu_si128((const __m128i *)x[i].scales), q8, i, d, vd, accm, scales);
+    //}
+    template <typename Q8>
+    inline void new_block(int i, const Q8& q8, __m256 * accm, __m256i * scales) {
+        d = GGML_FP16_TO_FP32(x[i].d);
+        process_mins_and_scales_16_a(_mm_loadu_si128((const __m128i *)x[i].scales), q8, i, -32.f*d, accm, scales);
+    }
+    inline void prepare(int i, int j) {
+        bits.prepare64(x[i].ql, j);
+        auto hbits = _mm256_loadu_si256((const __m256i *)x[i].qh + j);
+        bits.values[0] = _mm256_or_si256(bits.values[0], _mm256_and_si256(_mm256_slli_epi16(hbits, 4), mh));
+        bits.values[1] = _mm256_or_si256(bits.values[1], _mm256_and_si256(_mm256_slli_epi16(hbits, 2), mh));
+        bits.values[2] = _mm256_or_si256(bits.values[2], _mm256_and_si256(hbits, mh));
+        bits.values[3] = _mm256_or_si256(bits.values[3], _mm256_and_si256(_mm256_srli_epi16(hbits, 2), mh));
+    }
+
+    Q4Bits  bits;
+    const __m256i mh = _mm256_set1_epi8(0x30);
 };
 
 inline void set_scales_16(const __m256i& all_scales, __m256i * scales) {
@@ -472,8 +528,8 @@ inline void set_scales_16(const __m256i& all_scales, __m256i * scales) {
 //
 // ================================== q3_K =============================================
 //
-template <int nrc_y>
-static void mul_mat_q3_K_q8_K_T(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+template <int nrc_y, typename Dequantizer>
+static void mul_mat_qY_K_q8_K_T(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
     assert(n%QK_K == 0);
     const int nb = n/QK_K;
 
@@ -481,20 +537,23 @@ static void mul_mat_q3_K_q8_K_T(int n, const void * vx, size_t bx, const DataInf
 
     __m256i all_scales[2];
     __m256i scales[4];
-    __m256  vd[nrc_y];
+    //__m256  vd[nrc_y];
+    //__m256  accm[nrc_y];
+    __m256  accd[nrc_y];
 
-    DequantizerQ3K deq(vx, bx);
+    Dequantizer deq(vx, bx);
 
     for (int ix = 0; ix < nrc_x; ++ix) {
 
         deq.new_row(ix);
 
-        __m256 accd[nrc_y], accm[nrc_y];
-        for (int iy = 0; iy < nrc_y; ++iy) accd[iy] = accm[iy] = _mm256_setzero_ps();
+        //for (int iy = 0; iy < nrc_y; ++iy) accd[iy] = accm[iy] = _mm256_setzero_ps();
+        for (int iy = 0; iy < nrc_y; ++iy) accd[iy] = _mm256_setzero_ps();
 
         for (int i = 0; i < nb; ++i) {
 
-            deq.new_block(i, q8, accm, vd, all_scales);
+            //deq.new_block(i, q8, accm, vd, all_scales);
+            deq.new_block(i, q8, accd, all_scales);
 
             __m256i sumi[nrc_y];
 
@@ -505,15 +564,16 @@ static void mul_mat_q3_K_q8_K_T(int n, const void * vx, size_t bx, const DataInf
             }
 
             for (int iy = 0; iy < nrc_y; ++iy) {
-                accd[iy] = _mm256_fmadd_ps(vd[iy], _mm256_cvtepi32_ps(sumi[iy]), accd[iy]);
+                //accd[iy] = _mm256_fmadd_ps(vd[iy], _mm256_cvtepi32_ps(sumi[iy]), accd[iy]);
+                accd[iy] = _mm256_fmadd_ps(_mm256_set1_ps(deq.d*q8.scale(iy, i)), _mm256_cvtepi32_ps(sumi[iy]), accd[iy]);
             }
 
         }
 
         for (int iy = 0; iy < nrc_y; ++iy) {
-            info.store(ix, iy, hsum_float_8(accd[iy]) - 4.f*hsum_float_8(accm[iy]));
-            //accd[iy] = _mm256_fmadd_ps(_mm256_set1_ps(-4.f), accm[iy], accd[iy]);
-            //info.store(ix, iy, hsum_float_8(accd[iy]));
+            ////info.store(ix, iy, hsum_float_8(accd[iy]) + Dequantizer::min*hsum_float_8(accm[iy]));
+            //accd[iy] = _mm256_fmadd_ps(_mm256_set1_ps(Dequantizer::min), accm[iy], accd[iy]);
+            info.store(ix, iy, hsum_float_8(accd[iy]));
         }
 
     }
@@ -623,97 +683,54 @@ static void mul_mat_qX_K_q8_K_T(int n, const void * vx, size_t bx, const DataInf
 // ========================================= q6_K ========================================================
 //
 
-template <int nrc_y>
-static void mul_mat_q6_K_q8_K_T(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
-    assert(n % QK_K == 0);
-    const int nb = n / QK_K;
-
-    const __m256i m4 = _mm256_set1_epi8(0xF);
-    const __m256i mh = _mm256_set1_epi8(0x30);
-
-    Q8<nrc_y> q8(info);
-
-    __m256i scales[2];
-    __m256  vd[nrc_y];
-    __m256  accm[nrc_y];
-    __m256  accd[nrc_y];
-
-    for (int ix = 0; ix < nrc_x; ++ix) {
-
-        const block_q6_K * x = (const block_q6_K *)((const char *)vx + ix*bx);
-
-        for (int iy = 0; iy < nrc_y; ++iy) accm[iy] = accd[iy] = _mm256_setzero_ps();
-
-        for (int i = 0; i < nb; ++i) {
-
-            const float d6 = GGML_FP16_TO_FP32(x[i].d);
-
-            const uint8_t * q4 = x[i].ql;
-            const uint8_t * qh = x[i].qh;
-
-            const __m128i scales8 = _mm_loadu_si128((const __m128i*)x[i].scales);
-            const __m256i scales16 = _mm256_cvtepi8_epi16(scales8);
-            scales[0] = MM256_SET_M128I(_mm256_castsi256_si128(scales16), _mm256_castsi256_si128(scales16));
-            scales[1] = MM256_SET_M128I(_mm256_extractf128_si256(scales16, 1), _mm256_extractf128_si256(scales16, 1));
-
-            for (int iy = 0; iy < nrc_y; ++iy) {
-                vd[iy] = _mm256_set1_ps(d6 * q8.scale(iy, i));
-                const __m256i prod  = _mm256_madd_epi16(scales16, q8.load_bsums(iy, i));
-                accm[iy] = _mm256_fmadd_ps(vd[iy], _mm256_cvtepi32_ps(prod), accm[iy]);
-            }
-
-            __m256i sumi[nrc_y];
-            for (int iy = 0; iy < nrc_y; ++iy) sumi[iy] = _mm256_setzero_si256();
-
-            for (int j = 0; j < QK_K/128; ++j) {
-
-                const __m256i scale_0 = _mm256_shuffle_epi8(scales[j], get_scale_shuffle_16(0));
-                const __m256i scale_1 = _mm256_shuffle_epi8(scales[j], get_scale_shuffle_16(1));
-                const __m256i scale_2 = _mm256_shuffle_epi8(scales[j], get_scale_shuffle_16(2));
-                const __m256i scale_3 = _mm256_shuffle_epi8(scales[j], get_scale_shuffle_16(3));
-
-                const __m256i q4bits1 = _mm256_loadu_si256((const __m256i*)q4); q4 += 32;
-                const __m256i q4bits2 = _mm256_loadu_si256((const __m256i*)q4); q4 += 32;
-                const __m256i q4bitsH = _mm256_loadu_si256((const __m256i*)qh); qh += 32;
-
-                const __m256i q4h_0 = _mm256_and_si256(_mm256_slli_epi16(q4bitsH, 4), mh);
-                const __m256i q4h_1 = _mm256_and_si256(_mm256_slli_epi16(q4bitsH, 2), mh);
-                const __m256i q4h_2 = _mm256_and_si256(q4bitsH, mh);
-                const __m256i q4h_3 = _mm256_and_si256(_mm256_srli_epi16(q4bitsH, 2), mh);
-
-                const __m256i q6_0 = _mm256_or_si256(_mm256_and_si256(q4bits1, m4), q4h_0);
-                const __m256i q6_1 = _mm256_or_si256(_mm256_and_si256(q4bits2, m4), q4h_1);
-                const __m256i q6_2 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits1, 4), m4), q4h_2);
-                const __m256i q6_3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits2, 4), m4), q4h_3);
-
-                for (int iy = 0; iy < nrc_y; ++iy) {
-
-                    __m256i p16_0 = _mm256_maddubs_epi16(q6_0, q8.load_quants(iy, i, 4*j+0));
-                    __m256i p16_1 = _mm256_maddubs_epi16(q6_1, q8.load_quants(iy, i, 4*j+1));
-                    __m256i p16_2 = _mm256_maddubs_epi16(q6_2, q8.load_quants(iy, i, 4*j+2));
-                    __m256i p16_3 = _mm256_maddubs_epi16(q6_3, q8.load_quants(iy, i, 4*j+3));
-
-                    p16_0 = _mm256_madd_epi16(scale_0, p16_0);
-                    p16_1 = _mm256_madd_epi16(scale_1, p16_1);
-                    p16_2 = _mm256_madd_epi16(scale_2, p16_2);
-                    p16_3 = _mm256_madd_epi16(scale_3, p16_3);
-
-                    sumi[iy] = _mm256_add_epi32(sumi[iy], _mm256_add_epi32(_mm256_add_epi32(p16_0, p16_1), _mm256_add_epi32(p16_2, p16_3)));
-                }
-
-            }
-
-            for (int iy = 0; iy < nrc_y; ++iy) {
-                accd[iy] = _mm256_fmadd_ps(vd[iy], _mm256_cvtepi32_ps(sumi[iy]), accd[iy]);
-            }
-        }
-
-        for (int iy = 0; iy < nrc_y; ++iy) {
-            info.store(ix, iy, hsum_float_8(accd[iy]) - 32.f*hsum_float_8(accm[iy]));
-        }
-
-    }
-}
+//template <int nrc_y>
+//static void mul_mat_q6_K_q8_K_T(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+//    assert(n % QK_K == 0);
+//    const int nb = n / QK_K;
+//
+//    Q8<nrc_y> q8(info);
+//
+//    __m256i all_scales[2];
+//    __m256i scales[4];
+//    __m256  vd[nrc_y];
+//    __m256  accm[nrc_y];
+//    __m256  accd[nrc_y];
+//
+//    DequantizerQ6K deq(vx, bx);
+//
+//    for (int ix = 0; ix < nrc_x; ++ix) {
+//
+//        deq.new_row(ix);
+//
+//        for (int iy = 0; iy < nrc_y; ++iy) accm[iy] = accd[iy] = _mm256_setzero_ps();
+//
+//        for (int i = 0; i < nb; ++i) {
+//
+//            deq.new_block(i, q8, accm, vd, all_scales);
+//
+//            __m256i sumi[nrc_y];
+//
+//            for (int j = 0; j < QK_K/128; ++j) {
+//
+//                deq.prepare(i, j);
+//
+//                set_scales_16(all_scales[j], scales);
+//
+//                sum_block_8(deq.bits, scales, j, i, q8, sumi);
+//
+//            }
+//
+//            for (int iy = 0; iy < nrc_y; ++iy) {
+//                accd[iy] = _mm256_fmadd_ps(vd[iy], _mm256_cvtepi32_ps(sumi[iy]), accd[iy]);
+//            }
+//        }
+//
+//        for (int iy = 0; iy < nrc_y; ++iy) {
+//            info.store(ix, iy, hsum_float_8(accd[iy]) - 32.f*hsum_float_8(accm[iy]));
+//        }
+//
+//    }
+//}
 
 //
 // ========================================= IQ4_XS ========================================================
@@ -1162,10 +1179,10 @@ bool set_mul_mat(int typeA, int ne00, mul_mat_t& mm_nx1, mul_mat_t& mm_nx2, mul_
             break;
         case GGML_TYPE_Q3_K:
             assert (ne00 % QK_K == 0);
-            mm_nx1 = mul_mat_q3_K_q8_K_T<1>;
-            mm_nx2 = mul_mat_q3_K_q8_K_T<2>;
-            mm_nx4 = mul_mat_q3_K_q8_K_T<4>;
-            mm_nx8 = mul_mat_q3_K_q8_K_T<8>;
+            mm_nx1 = mul_mat_qY_K_q8_K_T<1, DequantizerQ3K>;
+            mm_nx2 = mul_mat_qY_K_q8_K_T<2, DequantizerQ3K>;
+            mm_nx4 = mul_mat_qY_K_q8_K_T<4, DequantizerQ3K>;
+            mm_nx8 = mul_mat_qY_K_q8_K_T<8, DequantizerQ3K>;
             break;
         case GGML_TYPE_Q4_K:
             assert (ne00 % QK_K == 0);
@@ -1183,10 +1200,10 @@ bool set_mul_mat(int typeA, int ne00, mul_mat_t& mm_nx1, mul_mat_t& mm_nx2, mul_
             break;
         case GGML_TYPE_Q6_K:
             assert (ne00 % QK_K == 0);
-            mm_nx1 = mul_mat_q6_K_q8_K_T<1>;
-            mm_nx2 = mul_mat_q6_K_q8_K_T<2>;
-            mm_nx4 = mul_mat_q6_K_q8_K_T<4>;
-            mm_nx8 = mul_mat_q6_K_q8_K_T<8>;
+            mm_nx1 = mul_mat_qY_K_q8_K_T<1, DequantizerQ6K>;
+            mm_nx2 = mul_mat_qY_K_q8_K_T<2, DequantizerQ6K>;
+            mm_nx4 = mul_mat_qY_K_q8_K_T<4, DequantizerQ6K>;
+            mm_nx8 = mul_mat_qY_K_q8_K_T<8, DequantizerQ6K>;
             break;
         case GGML_TYPE_IQ4_XS:
             assert (ne00 % QK_K == 0);
