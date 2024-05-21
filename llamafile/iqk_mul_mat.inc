@@ -126,7 +126,9 @@ inline void mul_mat_NxM(int n, const void * vx, size_t bx, DataInfo& info, int n
     process(mm_nx8, 8) && process(mm_nx4, 4) && process(mm_nx2, 2) && process(mm_nx1, 1);
 }
 
-template <int nrc_y, typename block_q8 = block_q8_K> struct Q8 {
+template <int nrc, typename block_q8 = block_q8_K> struct Q8 {
+
+    constexpr static int nrc_y = nrc;
 
     Q8(const DataInfo& info) {
         for (int iy = 0; iy < nrc_y; ++iy) y[iy] = (const block_q8 *)info.src1_row(iy);
@@ -145,6 +147,7 @@ template <int nrc_y, typename block_q8 = block_q8_K> struct Q8 {
 // ================================== q2_K =============================================
 //
 namespace {
+
 template <int nrc_y>
 static void mul_mat_q2_K_q8_K_T(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
     assert(n%QK_K == 0);
@@ -377,6 +380,30 @@ static void mul_mat_q3_K_q8_K_T(int n, const void * vx, size_t bx, const DataInf
 // ================================== q4_K =============================================
 //
 
+// Handles q4_K and q5_K scales/mins
+struct Scales8K {
+    template <bool use_two, typename Q8>
+    inline __m256i process_mins_and_scales(const uint8_t * data, float c, int i, const Q8& q8, __m256 * accd) {
+        make_q4_scales(data, utmp);
+        const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
+        const __m128i mins128 = _mm256_extracti128_si256(mins_and_scales, 1);
+        const __m256i mins = MM256_SET_M128I(_mm_shuffle_epi8(mins128, shuffles[1]), _mm_shuffle_epi8(mins128, shuffles[0]));
+        for (int iy = 0; iy < Q8::nrc_y; ++iy) {
+            const __m256i q8s = q8.load_bsums(iy, i);
+            const __m256i prod = _mm256_madd_epi16(mins, q8s);
+            if constexpr (use_two && Q8::nrc_y <= 2) {
+                accd[2*iy+0] = _mm256_fmadd_ps(_mm256_set1_ps(c*q8.scale(iy, i)), _mm256_cvtepi32_ps(prod), accd[2*iy+0]);
+            } else {
+                accd[iy] = _mm256_fmadd_ps(_mm256_set1_ps(c*q8.scale(iy, i)), _mm256_cvtepi32_ps(prod), accd[iy]);
+            }
+        }
+        const __m128i sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
+        return MM256_SET_M128I(sc128, sc128);
+    }
+    const __m128i shuffles[2] = {_mm_set_epi32(0x07060706, 0x05040504, 0x03020302, 0x01000100),
+                                 _mm_set_epi32(0x0f0e0f0e, 0x0d0c0d0c, 0x0b0a0b0a, 0x09080908)};
+    uint32_t utmp[4];
+};
 template <int nrc_y>
 static void mul_mat_q4_K_q8_K_T(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
     assert(n % QK_K == 0);
@@ -386,19 +413,17 @@ static void mul_mat_q4_K_q8_K_T(int n, const void * vx, size_t bx, const DataInf
 
     Q8<nrc_y> q8(info);
 
-    uint32_t utmp[4];
-
     const __m256i ml = _mm256_set1_epi8(0x0F);
     const __m256i mh = _mm256_set1_epi8(-16); // to avoid stupid warnings if using 0xF0
 
-    __m128  accm[nrc_y];
+    Scales8K s8k;
+
     __m256i sumi[k_nrc];
     __m256  accd[k_nrc];
 
     for (int ix = 0; ix < nrc_x; ++ix) {
 
         for (int iy = 0; iy < nrc_y; ++iy) {
-            accm[iy] = _mm_setzero_ps();
             if (nrc_y <= 2) {
                 accd[2*iy+0] = accd[2*iy+1] = _mm256_setzero_ps();
             } else {
@@ -414,20 +439,7 @@ static void mul_mat_q4_K_q8_K_T(int n, const void * vx, size_t bx, const DataInf
 
             const uint8_t * q4 = x[i].qs;
 
-            __m256i scales;
-            {
-                make_q4_scales(x[i].scales, utmp);
-                const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
-                const __m128i mins = _mm256_extracti128_si256(mins_and_scales, 1);
-                const __m128i sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
-                scales = MM256_SET_M128I(sc128, sc128);
-                for (int iy = 0; iy < nrc_y; ++iy) {
-                    const __m256i q8sums = q8.load_bsums(iy, i);
-                    const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0), _mm256_extracti128_si256(q8sums, 1));
-                    const __m128i prod = _mm_madd_epi16(mins, q8s);
-                    accm[iy] = _mm_fmadd_ps(_mm_set1_ps(c*q8.scale(iy, i)), _mm_cvtepi32_ps(prod), accm[iy]);
-                }
-            }
+            __m256i scales = s8k.process_mins_and_scales<true>(x[i].scales, c, i, q8, accd);
 
             for (int iy = 0; iy < k_nrc; ++iy) sumi[iy] = _mm256_setzero_si256();
 
@@ -470,10 +482,9 @@ static void mul_mat_q4_K_q8_K_T(int n, const void * vx, size_t bx, const DataInf
 
         for (int iy = 0; iy < nrc_y; ++iy) {
             if (nrc_y <= 2) {
-                info.store(ix, iy, hsum_float_8(accd[2*iy+0]) + 0.0625f*hsum_float_8(accd[2*iy+1]) + hsum_float_4(accm[iy]));
+                info.store(ix, iy, hsum_float_8(accd[2*iy+0]) + 0.0625f*hsum_float_8(accd[2*iy+1]));
             } else {
-                const __m128 d = _mm_add_ps(_mm256_castps256_ps128(accd[iy]), _mm256_extractf128_ps(accd[iy], 1));
-                info.store(ix, iy, hsum_float_4(_mm_add_ps(d, accm[iy])));
+                info.store(ix, iy, hsum_float_8(accd[iy]));
             }
         }
 
@@ -490,14 +501,13 @@ static void mul_mat_q5_K_q8_K_T(int n, const void * vx, size_t bx, const DataInf
 
     Q8<nrc_y> q8(info);
 
-    uint32_t utmp[4];
-
     const __m256i ml = _mm256_set1_epi8(0x0F);
     const __m256i mh = _mm256_set1_epi8(0x10);
 
+    Scales8K s8k;
+
     for (int ix = 0; ix < nrc_x; ++ix) {
 
-        __m128 accm[nrc_y]; for (int iy = 0; iy < nrc_y; ++iy) accm[iy] = _mm_setzero_ps();
         __m256 accd[nrc_y]; for (int iy = 0; iy < nrc_y; ++iy) accd[iy] = _mm256_setzero_ps();
 
         const block_q5_K * x = (const block_q5_K *)((const char *)vx + bx*ix);
@@ -508,20 +518,7 @@ static void mul_mat_q5_K_q8_K_T(int n, const void * vx, size_t bx, const DataInf
 
             const uint8_t * q5 = x[i].qs;
 
-            __m256i scales;
-            {
-                make_q4_scales(x[i].scales, utmp);
-                const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
-                const __m128i mins = _mm256_extracti128_si256(mins_and_scales, 1);
-                const __m128i sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
-                scales = MM256_SET_M128I(sc128, sc128);
-                for (int iy = 0; iy < nrc_y; ++iy) {
-                    const __m256i q8sums = q8.load_bsums(iy, i);
-                    const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0), _mm256_extracti128_si256(q8sums, 1));
-                    const __m128i prod = _mm_madd_epi16(mins, q8s);
-                    accm[iy] = _mm_fmadd_ps(_mm_set1_ps(c*q8.scale(iy, i)), _mm_cvtepi32_ps(prod), accm[iy]);
-                }
-            }
+            __m256i scales = s8k.process_mins_and_scales<false>(x[i].scales, c, i, q8, accd);
 
             __m256i hbits[2];
             hbits[0] = _mm256_loadu_si256((const __m256i*)x[i].qh);
@@ -567,8 +564,7 @@ static void mul_mat_q5_K_q8_K_T(int n, const void * vx, size_t bx, const DataInf
         }
 
         for (int iy = 0; iy < nrc_y; ++iy) {
-            const __m128 d = _mm_add_ps(_mm256_castps256_ps128(accd[iy]), _mm256_extractf128_ps(accd[iy], 1));
-            info.store(ix, iy, hsum_float_4(_mm_add_ps(d, accm[iy])));
+            info.store(ix, iy, hsum_float_8(accd[iy]));
         }
 
     }
