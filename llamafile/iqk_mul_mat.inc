@@ -187,6 +187,20 @@ struct Scales8K {
     uint32_t utmp[4];
 };
 
+template <typename Q8>
+inline void process_mins_16(const __m256i& all_scales, const Q8& q8, int i, float d, __m256 * accm) {
+    for (int iy = 0; iy < Q8::nrc_y; ++iy) {
+        const __m256i prod  = _mm256_madd_epi16(all_scales, q8.load_bsums(iy, i));
+        accm[iy] = _mm256_fmadd_ps(_mm256_set1_ps(d * q8.scale(iy, i)), _mm256_cvtepi32_ps(prod), accm[iy]);
+    }
+}
+inline void prepare_scales_16(const __m256i& all_scales, __m256i * scales) {
+    const __m128i l_scales = _mm256_extracti128_si256(all_scales, 0);
+    const __m128i h_scales = _mm256_extracti128_si256(all_scales, 1);
+    scales[0] = MM256_SET_M128I(l_scales, l_scales);
+    scales[1] = MM256_SET_M128I(h_scales, h_scales);
+}
+
 template <typename Block>
 struct BaseDequantizer {
     BaseDequantizer(const void * vx, size_t bx) : vx(vx), bx(bx) {}
@@ -202,23 +216,45 @@ struct BaseDequantizer {
 };
 
 #ifdef HAVE_FANCY_SIMD
+
+struct BlockPermuter {
+    const __m512i permute1 = _mm512_set_epi64(11, 10,  9,  8, 3, 2, 1, 0);
+    const __m512i permute2 = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
+};
+
 struct Q4Bits64 {
     inline void prepare(const uint8_t * q4) {
         auto q4bits = _mm512_loadu_si512((const __m512i*)q4 + 0);
         auto tmp1 = _mm512_and_si512(q4bits, ml);
         auto tmp2 = _mm512_and_si512(_mm512_srli_epi16(q4bits, 4), ml);
-        values[0] = _mm512_permutex2var_epi64(tmp1, permute1, tmp2);
-        values[1] = _mm512_permutex2var_epi64(tmp1, permute2, tmp2);
+        values[0] = _mm512_permutex2var_epi64(tmp1, perm.permute1, tmp2);
+        values[1] = _mm512_permutex2var_epi64(tmp1, perm.permute2, tmp2);
         q4bits = _mm512_loadu_si512((const __m512i*)q4 + 1);
         tmp1 = _mm512_and_si512(q4bits, ml);
         tmp2 = _mm512_and_si512(_mm512_srli_epi16(q4bits, 4), ml);
-        values[2] = _mm512_permutex2var_epi64(tmp1, permute1, tmp2);
-        values[3] = _mm512_permutex2var_epi64(tmp1, permute2, tmp2);
+        values[2] = _mm512_permutex2var_epi64(tmp1, perm.permute1, tmp2);
+        values[3] = _mm512_permutex2var_epi64(tmp1, perm.permute2, tmp2);
     }
     __m512i values[4];
     const __m512i ml = _mm512_set1_epi8(0xf);
-    const __m512i permute1 = _mm512_set_epi64(11, 10,  9,  8, 3, 2, 1, 0);
-    const __m512i permute2 = _mm512_set_epi64(15, 14, 13, 12, 7, 6, 5, 4);
+    BlockPermuter perm;
+};
+
+struct Q2Bits64 {
+    inline void prepare(const uint8_t * q2) {
+        auto q2bits = _mm512_loadu_si512((const __m512i*)q2);
+        auto tmp1 = _mm512_and_si512(q2bits, ml);
+        auto tmp2 = _mm512_and_si512(_mm512_srli_epi16(q2bits, 2), ml);
+        values[0] = _mm512_permutex2var_epi64(tmp1, perm.permute1, tmp2);
+        values[2] = _mm512_permutex2var_epi64(tmp1, perm.permute2, tmp2);
+        tmp1 = _mm512_and_si512(_mm512_srli_epi16(q2bits, 4), ml);
+        tmp2 = _mm512_and_si512(_mm512_srli_epi16(q2bits, 6), ml);
+        values[1] = _mm512_permutex2var_epi64(tmp1, perm.permute1, tmp2);
+        values[3] = _mm512_permutex2var_epi64(tmp1, perm.permute2, tmp2);
+    }
+    __m512i values[4];
+    const __m512i ml = _mm512_set1_epi8(0x03);
+    BlockPermuter perm;
 };
 
 struct DequantizerQ4K_64 final : public BaseDequantizer<block_q4_K> {
@@ -302,6 +338,77 @@ static void mul_mat_qX_K_q8_K_T_64(int n, const void * vx, size_t bx, const Data
                 const __m512i p4 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), deq.bits.values[3], q8.load_quants_64(iy, i, 3));
                 auto sumi = _mm512_dpwssd_epi32(_mm512_setzero_si512(), scales1, _mm512_packs_epi32(p1, p2));
                 sumi = _mm512_dpwssd_epi32(sumi, scales2, _mm512_packs_epi32(p3, p4));
+                accd[iy] = _mm512_fmadd_ps(_mm512_set1_ps(deq.d*q8.scale(iy, i)), _mm512_cvtepi32_ps(sumi), accd[iy]);
+            }
+
+        }
+
+        for (int iy = 0; iy < nrc_y; ++iy) {
+            auto sum256 = _mm256_add_ps(_mm512_castps512_ps256(accd[iy]), _mm512_extractf32x8_ps(accd[iy], 1));
+            info.store(ix, iy, hsum_float_8(_mm256_add_ps(accm[iy], sum256)));
+        }
+
+    }
+}
+
+struct DequantizerQ2K_64 final : public BaseDequantizer<block_q2_K> {
+    DequantizerQ2K_64(const void * vx, size_t bx) : BaseDequantizer(vx, bx) {}
+    template <typename Q8>
+    inline void new_block(int i, const Q8& q8, __m256 * accm, __m512i * scales) {
+        d = GGML_FP16_TO_FP32(x[i].d);
+        bits.prepare(x[i].qs);
+        const __m128i mins_and_scales = _mm_loadu_si128((const __m128i*)x[i].scales);
+        const __m128i scales8 = _mm_and_si128(mins_and_scales, m4);
+        const __m128i mins8 = _mm_and_si128(_mm_srli_epi16(mins_and_scales, 4), m4);
+        process_mins_16(_mm256_cvtepi8_epi16(mins8), q8, i, -GGML_FP16_TO_FP32(x[i].dmin), accm);
+        auto all_scales8 = MM256_SET_M128I(scales8, scales8);
+        auto scales1 = _mm256_shuffle_epi8(all_scales8, shuffle1);
+        auto scales2 = _mm256_shuffle_epi8(all_scales8, shuffle2);
+        scales[0] = _mm512_cvtepi8_epi16(scales1);
+        scales[1] = _mm512_cvtepi8_epi16(scales2);
+    }
+
+    Q2Bits64 bits;
+    const __m128i m4 = _mm_set1_epi8(0xf);
+    const __m256i shuffle1 = _mm256_set_epi32(0x07070707, 0x03030303, 0x06060606, 0x02020202,
+                                              0x05050505, 0x01010101, 0x04040404, 0x00000000);
+    const __m256i shuffle2 = _mm256_set_epi32(0x0f0f0f0f, 0x0b0b0b0b, 0x0e0e0e0e, 0x0a0a0a0a,
+                                              0x0d0d0d0d, 0x09090909, 0x0c0c0c0c, 0x08080808);
+
+};
+
+//template <typename Dequantizer, int nrc_y>
+template <int nrc_y>
+static void mul_mat_qY_K_q8_K_T_64(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    assert(n % QK_K == 0);
+    const int nb = n / QK_K;
+
+    Q8<nrc_y> q8(info);
+
+    DequantizerQ2K_64 deq(vx, bx);
+
+    __m256  accm[nrc_y];
+    __m512  accd[nrc_y];
+    __m512i scales[2];
+
+    for (int ix = 0; ix < nrc_x; ++ix) {
+
+        for (int iy = 0; iy < nrc_y; ++iy) accd[iy] = _mm512_setzero_ps();
+        for (int iy = 0; iy < nrc_y; ++iy) accm[iy] = _mm256_setzero_ps();
+
+        deq.new_row(ix);
+
+        for (int i = 0; i < nb; ++i) {
+
+            deq.new_block(i, q8, accm, scales);
+
+            for (int iy = 0; iy < nrc_y; ++iy) {
+                const __m512i p1 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), deq.bits.values[0], q8.load_quants_64(iy, i, 0));
+                const __m512i p2 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), deq.bits.values[1], q8.load_quants_64(iy, i, 1));
+                const __m512i p3 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), deq.bits.values[2], q8.load_quants_64(iy, i, 2));
+                const __m512i p4 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), deq.bits.values[3], q8.load_quants_64(iy, i, 3));
+                auto sumi = _mm512_dpwssd_epi32(_mm512_setzero_si512(), scales[0], _mm512_packs_epi32(p1, p2));
+                sumi = _mm512_dpwssd_epi32(sumi, scales[1], _mm512_packs_epi32(p3, p4));
                 accd[iy] = _mm512_fmadd_ps(_mm512_set1_ps(deq.d*q8.scale(iy, i)), _mm512_cvtepi32_ps(sumi), accd[iy]);
             }
 
@@ -488,20 +595,6 @@ struct DequantizerQ5K final : public BaseDequantizer<block_q5_K> {
     HighBit5 hbits;
     Scales8K s8k;
 };
-
-template <typename Q8>
-inline void process_mins_16(const __m256i& all_scales, const Q8& q8, int i, float d, __m256 * accm) {
-    for (int iy = 0; iy < Q8::nrc_y; ++iy) {
-        const __m256i prod  = _mm256_madd_epi16(all_scales, q8.load_bsums(iy, i));
-        accm[iy] = _mm256_fmadd_ps(_mm256_set1_ps(d * q8.scale(iy, i)), _mm256_cvtepi32_ps(prod), accm[iy]);
-    }
-}
-inline void prepare_scales_16(const __m256i& all_scales, __m256i * scales) {
-    const __m128i l_scales = _mm256_extracti128_si256(all_scales, 0);
-    const __m128i h_scales = _mm256_extracti128_si256(all_scales, 1);
-    scales[0] = MM256_SET_M128I(l_scales, l_scales);
-    scales[1] = MM256_SET_M128I(h_scales, h_scales);
-}
 
 template <typename Q8>
 inline void process_mins_and_scales_16(const __m128i& scales128, const Q8& q8, int i, float d,
@@ -1062,7 +1155,14 @@ bool set_mul_mat(int typeA, int ne00, mul_mat_t& mm_nx1, mul_mat_t& mm_nx2, mul_
     switch (typeA) {
         case GGML_TYPE_Q2_K:
             assert (ne00 % QK_K == 0);
+#ifdef HAVE_FANCY_SIMD
+            mm_nx1 = mul_mat_qY_K_q8_K_T_64<1>;
+            mm_nx2 = mul_mat_qY_K_q8_K_T_64<2>;
+            mm_nx4 = mul_mat_qY_K_q8_K_T_64<4>;
+            mm_nx8 = mul_mat_qY_K_q8_K_T_64<8>;
+#else
             set_mul_mat_funcs_16<DequantizerQ2K>(mm_nx1, mm_nx2, mm_nx4, mm_nx8);
+#endif
             break;
         case GGML_TYPE_Q3_K:
             assert (ne00 % QK_K == 0);
