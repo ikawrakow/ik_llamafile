@@ -201,6 +201,22 @@ inline void prepare_scales_16(const __m256i& all_scales, __m256i * scales) {
     scales[1] = MM256_SET_M128I(h_scales, h_scales);
 }
 
+struct ScaleQ3 {
+    inline __m128i make_scales(const uint16_t * s8) const {
+        const uint16_t * scales16 = (const uint16_t *)s8;
+        uint32_t aux0 = scales16[0] | (scales16[1] << 16);
+        uint32_t aux1 = scales16[2] | (scales16[3] << 16);
+        uint32_t aux2 = scales16[4] | (scales16[5] << 16);
+        __m128i scales128 = _mm_set_epi32(
+            ((aux1 >> 4) & 0x0f0f0f0f) | ((aux2 >> 2) & 0x30303030),
+            ((aux0 >> 4) & 0x0f0f0f0f) | ((aux2 >> 0) & 0x30303030),
+             (aux1       & 0x0f0f0f0f) | ((aux2 << 2) & 0x30303030),
+             (aux0       & 0x0f0f0f0f) | ((aux2 << 4) & 0x30303030));
+        return _mm_add_epi8(scales128, m32);
+    }
+    const __m128i m32 = _mm_set1_epi8(-32);
+};
+
 template <typename Block>
 struct BaseDequantizer {
     BaseDequantizer(const void * vx, size_t bx) : vx(vx), bx(bx) {}
@@ -371,6 +387,26 @@ static void mul_mat_qX_K_q8_K_T_64(int n, const void * vx, size_t bx, const Data
     }
 }
 
+struct Scale16_64 {
+    inline void make_scales(const __m128i& scales8, __m512i * scales) const {
+        auto all_scales8 = MM256_SET_M128I(scales8, scales8);
+        auto scales1 = _mm256_shuffle_epi8(all_scales8, shuffle1);
+        auto scales2 = _mm256_shuffle_epi8(all_scales8, shuffle2);
+        scales[0] = _mm512_cvtepi8_epi16(scales1);
+        scales[1] = _mm512_cvtepi8_epi16(scales2);
+    }
+    template <typename Q8>
+    inline void process_mins_and_scales(int i, float c, const __m128i& mins8, const __m128i& scales8,
+        const Q8& q8, __m256 * accm, __m512i * scales) const {
+        process_mins_16(_mm256_cvtepi8_epi16(mins8), q8, i, c, accm);
+        make_scales(scales8, scales);
+    }
+    const __m256i shuffle1 = _mm256_set_epi32(0x07070707, 0x03030303, 0x06060606, 0x02020202,
+                                              0x05050505, 0x01010101, 0x04040404, 0x00000000);
+    const __m256i shuffle2 = _mm256_set_epi32(0x0f0f0f0f, 0x0b0b0b0b, 0x0e0e0e0e, 0x0a0a0a0a,
+                                              0x0d0d0d0d, 0x09090909, 0x0c0c0c0c, 0x08080808);
+};
+
 struct DequantizerQ2K_64 final : public BaseDequantizer<block_q2_K> {
     DequantizerQ2K_64(const void * vx, size_t bx) : BaseDequantizer(vx, bx) {}
     template <typename Q8>
@@ -380,20 +416,12 @@ struct DequantizerQ2K_64 final : public BaseDequantizer<block_q2_K> {
         const __m128i mins_and_scales = _mm_loadu_si128((const __m128i*)x[i].scales);
         const __m128i scales8 = _mm_and_si128(mins_and_scales, m4);
         const __m128i mins8 = _mm_and_si128(_mm_srli_epi16(mins_and_scales, 4), m4);
-        process_mins_16(_mm256_cvtepi8_epi16(mins8), q8, i, -GGML_FP16_TO_FP32(x[i].dmin), accm);
-        auto all_scales8 = MM256_SET_M128I(scales8, scales8);
-        auto scales1 = _mm256_shuffle_epi8(all_scales8, shuffle1);
-        auto scales2 = _mm256_shuffle_epi8(all_scales8, shuffle2);
-        scales[0] = _mm512_cvtepi8_epi16(scales1);
-        scales[1] = _mm512_cvtepi8_epi16(scales2);
+        sc16.process_mins_and_scales(i, -GGML_FP16_TO_FP32(x[i].dmin), mins8, scales8, q8, accm, scales);
     }
 
     Q2Bits64 bits;
+    Scale16_64 sc16;
     const __m128i m4 = _mm_set1_epi8(0xf);
-    const __m256i shuffle1 = _mm256_set_epi32(0x07070707, 0x03030303, 0x06060606, 0x02020202,
-                                              0x05050505, 0x01010101, 0x04040404, 0x00000000);
-    const __m256i shuffle2 = _mm256_set_epi32(0x0f0f0f0f, 0x0b0b0b0b, 0x0e0e0e0e, 0x0a0a0a0a,
-                                              0x0d0d0d0d, 0x09090909, 0x0c0c0c0c, 0x08080808);
 
 };
 
@@ -404,37 +432,16 @@ struct DequantizerQ3K_64 final : public BaseDequantizer<block_q3_K> {
         d = GGML_FP16_TO_FP32(x[i].d);
         bits.prepare(x[i].qs);
         hbits.apply(x[i].hmask, bits);
-        auto scales128 = make_scales((const uint16_t *)x[i].scales);
-        process_mins_16(_mm256_cvtepi8_epi16(scales128), q8, i, -4.f*d, accm);
-        auto all_scales8 = MM256_SET_M128I(scales128, scales128);
-        auto scales1 = _mm256_shuffle_epi8(all_scales8, shuffle1);
-        auto scales2 = _mm256_shuffle_epi8(all_scales8, shuffle2);
-        scales[0] = _mm512_cvtepi8_epi16(scales1);
-        scales[1] = _mm512_cvtepi8_epi16(scales2);
-    }
-
-    inline __m128i make_scales(const uint16_t * s8) const {
-        const uint16_t * scales16 = (const uint16_t *)s8;
-        uint32_t aux0 = scales16[0] | (scales16[1] << 16);
-        uint32_t aux1 = scales16[2] | (scales16[3] << 16);
-        uint32_t aux2 = scales16[4] | (scales16[5] << 16);
-        __m128i scales128 = _mm_set_epi32(
-            ((aux1 >> 4) & 0x0f0f0f0f) | ((aux2 >> 2) & 0x30303030),
-            ((aux0 >> 4) & 0x0f0f0f0f) | ((aux2 >> 0) & 0x30303030),
-             (aux1       & 0x0f0f0f0f) | ((aux2 << 2) & 0x30303030),
-             (aux0       & 0x0f0f0f0f) | ((aux2 << 4) & 0x30303030));
-        return _mm_add_epi8(scales128, m32);
+        auto scales128 = sc3.make_scales((const uint16_t *)x[i].scales);
+        sc16.process_mins_and_scales(i, -4.f*d, scales128, scales128, q8, accm, scales);
     }
 
     Q2Bits64 bits;
     HighBit3_64 hbits;
+    ScaleQ3 sc3;
+    Scale16_64 sc16;
     const __m128i m4  = _mm_set1_epi8(0xf);
     const __m128i m32 = _mm_set1_epi8(-32);
-    const __m256i shuffle1 = _mm256_set_epi32(0x07070707, 0x03030303, 0x06060606, 0x02020202,
-                                              0x05050505, 0x01010101, 0x04040404, 0x00000000);
-    const __m256i shuffle2 = _mm256_set_epi32(0x0f0f0f0f, 0x0b0b0b0b, 0x0e0e0e0e, 0x0a0a0a0a,
-                                              0x0d0d0d0d, 0x09090909, 0x0c0c0c0c, 0x08080808);
-
 };
 
 struct DequantizerQ6K_64 final : public BaseDequantizer<block_q6_K> {
@@ -445,12 +452,7 @@ struct DequantizerQ6K_64 final : public BaseDequantizer<block_q6_K> {
         bits.prepare64(x[i].ql);
         add_high_bits(x[i].qh, bits);
         auto scales128 = _mm_loadu_si128((const __m128i *)x[i].scales);
-        process_mins_16(_mm256_cvtepi8_epi16(scales128), q8, i, -32.f*d, accm);
-        auto all_scales8 = MM256_SET_M128I(scales128, scales128);
-        auto scales1 = _mm256_shuffle_epi8(all_scales8, shuffle1);
-        auto scales2 = _mm256_shuffle_epi8(all_scales8, shuffle2);
-        scales[0] = _mm512_cvtepi8_epi16(scales1);
-        scales[1] = _mm512_cvtepi8_epi16(scales2);
+        sc16.process_mins_and_scales(i, -32.f*d, scales128, scales128, q8, accm, scales);
     }
 
     inline void add_high_bits(const uint8_t * qh, Q4Bits64& bits) const {
@@ -467,12 +469,9 @@ struct DequantizerQ6K_64 final : public BaseDequantizer<block_q6_K> {
 
     Q4Bits64 bits;
     HighBit3_64 hbits;
+    Scale16_64 sc16;
 
     const __m512i mh = _mm512_set1_epi8(0x30);
-    const __m256i shuffle1 = _mm256_set_epi32(0x07070707, 0x03030303, 0x06060606, 0x02020202,
-                                              0x05050505, 0x01010101, 0x04040404, 0x00000000);
-    const __m256i shuffle2 = _mm256_set_epi32(0x0f0f0f0f, 0x0b0b0b0b, 0x0e0e0e0e, 0x0a0a0a0a,
-                                              0x0d0d0d0d, 0x09090909, 0x0c0c0c0c, 0x08080808);
 
 };
 
@@ -709,28 +708,16 @@ struct DequantizerQ3K final : public BaseDequantizer<block_q3_K> {
     inline void new_block(int i, const Q8& q8, __m256 * accm, __m256i * scales) {
         d = GGML_FP16_TO_FP32(x[i].d);
         hbits.load(x[i].hmask);
-        process_mins_and_scales_16(make_scales((const uint16_t *)x[i].scales), q8, i, -4.f*d, accm, scales);
+        process_mins_and_scales_16(sc3.make_scales((const uint16_t *)x[i].scales), q8, i, -4.f*d, accm, scales);
     }
     inline void prepare(int i, int j) {
         bits.prepare(x[i].qs, j);
         hbits.apply(bits, j == 0);
     }
 
-    inline __m128i make_scales(const uint16_t * s8) const {
-        const uint16_t * scales16 = (const uint16_t *)s8;
-        uint32_t aux0 = scales16[0] | (scales16[1] << 16);
-        uint32_t aux1 = scales16[2] | (scales16[3] << 16);
-        uint32_t aux2 = scales16[4] | (scales16[5] << 16);
-        __m128i scales128 = _mm_set_epi32(
-            ((aux1 >> 4) & 0x0f0f0f0f) | ((aux2 >> 2) & 0x30303030),
-            ((aux0 >> 4) & 0x0f0f0f0f) | ((aux2 >> 0) & 0x30303030),
-             (aux1       & 0x0f0f0f0f) | ((aux2 << 2) & 0x30303030),
-             (aux0       & 0x0f0f0f0f) | ((aux2 << 4) & 0x30303030));
-        return _mm_add_epi8(scales128, m32);
-    }
-
     Q2Bits  bits;
     HighBit3 hbits;
+    ScaleQ3 sc3;
 
     const __m128i m32 = _mm_set1_epi8(-32);
 };
