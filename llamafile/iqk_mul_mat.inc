@@ -294,6 +294,64 @@ struct DequantizerQ4K_64 final : public BaseDequantizer<block_q4_K> {
     Scales8K s8k;
 };
 
+struct DequantizerIQ4XS_64 final : public BaseDequantizer<block_iq4_xs> {
+    DequantizerIQ4XS_64(const void * vx, size_t bx) : BaseDequantizer(vx, bx), values(load_values()) {}
+    template <typename Q8>
+    inline __m512i new_block(int i, const Q8& q8, __m256 * accd) {
+        d = GGML_FP16_TO_FP32(x[i].d);
+        prepare(x[i].qs);
+        uint32_t tmp32 = x[i].scales_h | (x[i].scales_h << 14);
+        const __m128i sh = _mm_slli_epi16(_mm_and_si128(_mm_srlv_epi32(_mm_set1_epi32(tmp32), hshift), hmask), 4);
+        const __m128i sl = _mm_and_si128(_mm_srlv_epi32(_mm_set1_epi32(*(const uint32_t *)x[i].scales_l), lshift), lmask);
+        const __m128i scales128 = _mm_add_epi16(_mm_or_si128(sh, _mm_cvtepi8_epi16(_mm_shuffle_epi8(sl, lshuffle))), m32);
+        s8k.accum_mins(scales128, q8, i, -128.f*d, accd);
+        auto scales256 = MM256_SET_M128I(scales128, scales128);
+        return _mm512_inserti32x8(_mm512_castsi256_si512(scales256), scales256, 1);
+    }
+    static __m512i load_values() {
+        static const uint8_t kvalues_iq4nl[16] = {1, 24, 45, 63, 79, 93, 106, 118, 129, 141, 153, 166, 181, 197, 217, 241};
+        auto val128 = _mm_loadu_si128((const __m128i *)kvalues_iq4nl);
+        auto val256 = MM256_SET_M128I(val128, val128);
+        return _mm512_inserti32x8(_mm512_castsi256_si512(val256), val256, 1);
+    }
+    inline void prepare(const uint8_t * q4) {
+        //bits.values[0] = _mm512_shuffle_epi8(values, dequant16(q4+ 0));
+        //bits.values[1] = _mm512_shuffle_epi8(values, dequant16(q4+32));
+        //bits.values[2] = _mm512_shuffle_epi8(values, dequant16(q4+64));
+        //bits.values[3] = _mm512_shuffle_epi8(values, dequant16(q4+96));
+        // What is wrong with the following?
+        bits.prepare64(q4);
+        // We now have in bits.valuse[0]: 0...15, 32...47, 64...79, 96...111
+        //                bits.valuse[1]: 16..31, 48...63, 80...95, 112..127
+        //                etc.
+        auto tmp = _mm512_permutex2var_epi64(bits.values[0], permute1, bits.values[1]);
+        bits.values[1] = _mm512_shuffle_epi8(values, _mm512_permutex2var_epi64(bits.values[0], permute2, bits.values[1]));
+        bits.values[0] = _mm512_shuffle_epi8(values, tmp);
+        tmp = _mm512_permutex2var_epi64(bits.values[2], permute1, bits.values[3]);
+        bits.values[3] = _mm512_shuffle_epi8(values, _mm512_permutex2var_epi64(bits.values[2], permute2, bits.values[3]));
+        bits.values[2] = _mm512_shuffle_epi8(values, tmp);
+    }
+    inline __m512i dequant16(const uint8_t * qs) const {
+        const __m128i aux1 = _mm_loadu_si128((const __m128i *)qs+0);
+        const __m128i aux2 = _mm_loadu_si128((const __m128i *)qs+1);
+        const __m256i aux3 = MM256_SET_M128I(_mm_srli_epi16(aux1, 4), aux1);
+        const __m256i aux4 = MM256_SET_M128I(_mm_srli_epi16(aux2, 4), aux2);
+        return _mm512_and_si512(_mm512_inserti32x8(_mm512_castsi256_si512(aux3), aux4, 1), bits.ml);
+    }
+
+    Q4Bits64 bits;
+    Scales8K s8k;
+    const __m512i values;
+    const __m512i permute1 = _mm512_set_epi64(11, 10, 3, 2,  9,  8, 1, 0);
+    const __m512i permute2 = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
+    const __m128i hshift = _mm_set_epi32(12, 8, 4, 0);
+    const __m128i lshift = _mm_set_epi32(4, 0, 4, 0);
+    const __m128i hmask  = _mm_set1_epi16(0x03);
+    const __m128i lmask  = _mm_set1_epi8(0xf);
+    const __m128i lshuffle = _mm_set_epi32(0x07030602, 0x05010400, 0x07030602, 0x05010400);
+    const __m128i m32 = _mm_set1_epi16(-32);
+};
+
 struct HighBit5_64 {
     inline void apply(const uint8_t * h, Q4Bits64& bits) {
         auto hbits256 = _mm256_loadu_si256((const __m256i *)h);
@@ -1295,7 +1353,14 @@ bool set_mul_mat(int typeA, int ne00, mul_mat_t& mm_nx1, mul_mat_t& mm_nx2, mul_
             break;
         case GGML_TYPE_IQ4_XS:
             assert (ne00 % QK_K == 0);
+#ifdef HAVE_FANCY_SIMD
+            mm_nx1 = mul_mat_qX_K_q8_K_T_64<DequantizerIQ4XS_64, 1>;
+            mm_nx2 = mul_mat_qX_K_q8_K_T_64<DequantizerIQ4XS_64, 2>;
+            mm_nx4 = mul_mat_qX_K_q8_K_T_64<DequantizerIQ4XS_64, 4>;
+            mm_nx8 = mul_mat_qX_K_q8_K_T_64<DequantizerIQ4XS_64, 8>;
+#else
             set_mul_mat_funcs_8<DequantizerIQ4XS>(mm_nx1, mm_nx2, mm_nx4, mm_nx8);
+#endif
             break;
         case GGML_TYPE_Q4_0:
             assert (ne00 % Q4K_0 == 0);
